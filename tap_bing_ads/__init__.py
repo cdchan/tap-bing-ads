@@ -20,7 +20,8 @@ import arrow
 import backoff
 
 from tap_bing_ads import reports
-from tap_bing_ads.clients import log_service_call, BingBulkClient
+from tap_bing_ads.bulk import sync_core_objects
+from tap_bing_ads.clients import log_service_call
 from tap_bing_ads.exclusions import EXCLUSIONS
 from tap_bing_ads.transform import sobject_to_dict
 
@@ -58,9 +59,6 @@ ARRAY_TYPE_REGEX = r'ArrayOf([A-Za-z]+)'
 
 def get_user_agent():
     return CONFIG.get('user_agent', DEFAULT_USER_AGENT)
-
-class InvalidDateRangeEnd(Exception):
-    pass
 
 class CustomServiceClient(ServiceClient):
     def __init__(self, name, **kwargs):
@@ -501,118 +499,12 @@ def sync_accounts_stream(account_ids, catalog_item):
     singer.write_bookmark(STATE, 'accounts', 'last_record', max_accounts_last_modified)
     singer.write_state(STATE)
 
-def sync_campaigns(client, account_id, selected_streams):
-    # CampaignType defaults to 'Search', but there are other types of campaigns
-    response = client.GetCampaignsByAccountId(AccountId=account_id, CampaignType='Search Shopping DynamicSearchAds')
-    response_dict = sobject_to_dict(response)
-    if 'Campaign' in response_dict:
-        campaigns = response_dict['Campaign']
-
-        if 'campaigns' in selected_streams:
-            selected_fields = get_selected_fields(selected_streams['campaigns'])
-            singer.write_schema('campaigns', get_core_schema(client, 'Campaign'), ['Id'])
-            with metrics.record_counter('campaigns') as counter:
-                singer.write_records('campaigns',
-                                     filter_selected_fields_many(selected_fields, campaigns))
-                counter.increment(len(campaigns))
-
-        return map(lambda x: x['Id'], campaigns)
 
 
-def sync_campaigns(client, account_id, selected_streams):
-    bulk_client = BingBulkClient(CONFIG, account_id)
-
-    campaigns = []
-
-    stream = selected_streams.get('campaigns')
-
-    if stream:
-        schema = stream.schema.to_dict()
-        stream_metadata = metadata.to_map(stream.metadata)
-        singer.write_schema('campaigns', schema, ['Id'])
-
-    with metrics.record_counter('campaigns') as counter:
-        for entity in bulk_client.entities_generator(['Campaigns'], CONFIG['start_date']):
-            if not hasattr(entity, 'campaign'):
-                continue
-            # 'CampaignType' is a singleton list in the Bulk service
-            entity.campaign.CampaignType = (
-                entity.campaign.CampaignType[0]
-                if entity.campaign.CampaignType else None
-            )
-            campaign = singer.transform(
-                sobject_to_dict(entity.campaign),
-                schema,
-                stream_metadata)
-            campaigns.append(campaign)
-
-            if stream.is_selected():
-                singer.write_record(
-                    'campaigns',
-                    campaign
-                )
-                counter.increment()
-
-    return map(lambda x: x['Id'], campaigns)
 
 
-def sync_ad_groups(client, account_id, campaign_ids, selected_streams):
-    ad_group_ids = []
-    for campaign_id in campaign_ids:
-        response = client.GetAdGroupsByCampaignId(CampaignId=campaign_id)
-        response_dict = sobject_to_dict(response)
 
-        if 'AdGroup' in response_dict:
-            ad_groups = sobject_to_dict(response)['AdGroup']
 
-            if 'ad_groups' in selected_streams:
-                LOGGER.info('Syncing AdGroups for Account: {}, Campaign: {}'.format(
-                    account_id, campaign_id))
-                selected_fields = get_selected_fields(selected_streams['ad_groups'])
-                singer.write_schema('ad_groups', get_core_schema(client, 'AdGroup'), ['Id'])
-                with metrics.record_counter('ad_groups') as counter:
-                    singer.write_records('ad_groups',
-                                         filter_selected_fields_many(selected_fields, ad_groups))
-                    counter.increment(len(ad_groups))
-
-            ad_group_ids += list(map(lambda x: x['Id'], ad_groups))
-    return ad_group_ids
-
-def sync_ads(client, selected_streams, ad_group_ids):
-    for ad_group_id in ad_group_ids:
-        response = client.GetAdsByAdGroupId(
-            AdGroupId=ad_group_id,
-            AdTypes={
-                'AdType': [
-                    'AppInstall',
-                    'DynamicSearch',
-                    'ExpandedText',
-                    'Product',
-                    'Text',
-                    'Image'
-                ]
-            })
-        response_dict = sobject_to_dict(response)
-
-        if 'Ad' in response_dict:
-            selected_fields = get_selected_fields(selected_streams['ads'])
-            singer.write_schema('ads', get_core_schema(client, 'Ad'), ['Id'])
-            with metrics.record_counter('ads') as counter:
-                ads = response_dict['Ad']
-                singer.write_records('ads', filter_selected_fields_many(selected_fields, ads))
-                counter.increment(len(ads))
-
-def sync_core_objects(account_id, selected_streams):
-    client = create_sdk_client('CampaignManagementService', account_id)
-
-    LOGGER.info('Syncing Campaigns for Account: {}'.format(account_id))
-    campaign_ids = sync_campaigns(client, account_id, selected_streams)
-
-    if campaign_ids and ('ad_groups' in selected_streams or 'ads' in selected_streams):
-        ad_group_ids = sync_ad_groups(client, account_id, campaign_ids, selected_streams)
-        if 'ads' in selected_streams:
-            LOGGER.info('Syncing Ads for Account: {}'.format(account_id))
-            sync_ads(client, selected_streams, ad_group_ids)
 
 def type_report_row(row):
     for field_name, value in row.items():
@@ -909,7 +801,7 @@ async def sync_account_data(account_id, catalog, selected_streams):
 
     if len(all_core_streams & set(selected_streams)):
         LOGGER.info('Syncing core objects')
-        sync_core_objects(account_id, selected_streams)
+        sync_core_objects(account_id, selected_streams, CONFIG, STATE)
 
     if len(all_report_streams & set(selected_streams)):
         LOGGER.info('Syncing reports')
